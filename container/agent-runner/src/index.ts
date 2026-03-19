@@ -16,6 +16,7 @@
 
 import fs from 'fs';
 import path from 'path';
+import { execSync } from 'child_process';
 import { query, HookCallback, PreCompactHookInput } from '@anthropic-ai/claude-agent-sdk';
 import { fileURLToPath } from 'url';
 
@@ -504,6 +505,10 @@ async function runQuery(
 }
 
 async function main(): Promise<void> {
+  if (process.env.GITHUB_TOKEN) {
+    execSync(`git config --global url."https://x-token:${process.env.GITHUB_TOKEN}@github.com/".insteadOf "https://github.com/"`);
+  }
+
   let containerInput: ContainerInput;
 
   try {
