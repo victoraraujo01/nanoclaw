@@ -45,6 +45,11 @@ export class WhatsAppChannel implements Channel {
   private connected = false;
   private lidToPhoneMap: Record<string, string> = {};
   private outgoingQueue: Array<{ jid: string; text: string }> = [];
+  private outgoingMediaQueue: Array<{
+    jid: string;
+    filePath: string;
+    caption?: string;
+  }> = [];
   private flushing = false;
   private groupSyncTimerStarted = false;
 
@@ -253,6 +258,32 @@ export class WhatsAppChannel implements Channel {
               }
             }
 
+            // Audio attachment handling
+            if (normalized.audioMessage) {
+              try {
+                const buffer = await downloadMediaMessage(msg, 'buffer', {});
+                const groupDir = path.join(GROUPS_DIR, groups[chatJid].folder);
+                const attachDir = path.join(groupDir, 'attachments');
+                fs.mkdirSync(attachDir, { recursive: true });
+                const mimetype = normalized.audioMessage.mimetype || '';
+                const ext = mimetype.startsWith('audio/mp4') ? '.mp4' : '.ogg';
+                const audioId = msg.key.id || `audio-${Date.now()}`;
+                const filename = `audio-${audioId}${ext}`;
+                const filePath = path.join(attachDir, filename);
+                fs.writeFileSync(filePath, buffer as Buffer);
+                content = `[Voice note: attachments/${filename}]\nUse: voice-transcription attachments/${filename}`;
+                logger.info(
+                  { jid: chatJid, filename },
+                  'Downloaded audio attachment',
+                );
+              } catch (err) {
+                logger.warn(
+                  { err, jid: chatJid },
+                  'Failed to download audio attachment',
+                );
+              }
+            }
+
             // Skip protocol messages with no text content (encryption keys, read receipts, etc.)
             if (!content) continue;
 
@@ -316,6 +347,53 @@ export class WhatsAppChannel implements Channel {
         { jid, err, queueSize: this.outgoingQueue.length },
         'Failed to send, message queued',
       );
+    }
+  }
+
+  async sendMedia(jid: string, filePath: string, caption?: string): Promise<void> {
+    if (!this.connected) {
+      this.outgoingMediaQueue.push({ jid, filePath, caption });
+      logger.info(
+        { jid, filePath, queueSize: this.outgoingMediaQueue.length },
+        'WA disconnected, media queued',
+      );
+      return;
+    }
+    try {
+      await this.sendMediaDirect(jid, filePath, caption);
+      logger.info({ jid, filePath }, 'Media sent');
+    } catch (err) {
+      this.outgoingMediaQueue.push({ jid, filePath, caption });
+      logger.warn(
+        { jid, err, queueSize: this.outgoingMediaQueue.length },
+        'Failed to send media, queued',
+      );
+    }
+  }
+
+  private async sendMediaDirect(
+    jid: string,
+    filePath: string,
+    caption?: string,
+  ): Promise<void> {
+    const buffer = fs.readFileSync(filePath);
+    const ext = path.extname(filePath).toLowerCase();
+    const imageExts = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp']);
+
+    if (imageExts.has(ext)) {
+      await this.sock.sendMessage(jid, { image: buffer, caption });
+    } else {
+      const mimeMap: Record<string, string> = {
+        '.pdf': 'application/pdf',
+      };
+      const mimetype = mimeMap[ext] || 'application/octet-stream';
+      const fileName = path.basename(filePath);
+      await this.sock.sendMessage(jid, {
+        document: buffer,
+        mimetype,
+        fileName,
+        caption,
+      });
     }
   }
 
@@ -427,12 +505,19 @@ export class WhatsAppChannel implements Channel {
   }
 
   private async flushOutgoingQueue(): Promise<void> {
-    if (this.flushing || this.outgoingQueue.length === 0) return;
+    if (
+      this.flushing ||
+      (this.outgoingQueue.length === 0 && this.outgoingMediaQueue.length === 0)
+    )
+      return;
     this.flushing = true;
     try {
       logger.info(
-        { count: this.outgoingQueue.length },
-        'Flushing outgoing message queue',
+        {
+          messageCount: this.outgoingQueue.length,
+          mediaCount: this.outgoingMediaQueue.length,
+        },
+        'Flushing outgoing queue',
       );
       while (this.outgoingQueue.length > 0) {
         const item = this.outgoingQueue.shift()!;
@@ -441,6 +526,14 @@ export class WhatsAppChannel implements Channel {
         logger.info(
           { jid: item.jid, length: item.text.length },
           'Queued message sent',
+        );
+      }
+      while (this.outgoingMediaQueue.length > 0) {
+        const item = this.outgoingMediaQueue.shift()!;
+        await this.sendMediaDirect(item.jid, item.filePath, item.caption);
+        logger.info(
+          { jid: item.jid, filePath: item.filePath },
+          'Queued media sent',
         );
       }
     } finally {

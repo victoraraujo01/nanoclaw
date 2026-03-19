@@ -31,7 +31,12 @@ vi.mock('../db.js', () => ({
 // Mock image module
 vi.mock('../image.js', () => ({
   isImageMessage: vi.fn().mockReturnValue(false),
-  processImage: vi.fn().mockResolvedValue({ content: '[Image: attachments/test.jpg]', relativePath: 'attachments/test.jpg' }),
+  processImage: vi
+    .fn()
+    .mockResolvedValue({
+      content: '[Image: attachments/test.jpg]',
+      relativePath: 'attachments/test.jpg',
+    }),
 }));
 
 // Mock fs
@@ -44,6 +49,7 @@ vi.mock('fs', async () => {
       existsSync: vi.fn(() => true),
       mkdirSync: vi.fn(),
       writeFileSync: vi.fn(),
+      readFileSync: vi.fn().mockReturnValue(Buffer.from('fake-media-data')),
     },
   };
 });
@@ -545,7 +551,7 @@ describe('WhatsAppChannel', () => {
       );
     });
 
-    it('handles message with no extractable text (e.g. voice note without caption)', async () => {
+    it('downloads audio and injects voice-transcription command', async () => {
       const opts = createTestOpts();
       const channel = new WhatsAppChannel(opts);
 
@@ -554,7 +560,7 @@ describe('WhatsAppChannel', () => {
       await triggerMessages([
         {
           key: {
-            id: 'msg-8',
+            id: 'msg-audio-1',
             remoteJid: 'registered@g.us',
             participant: '5551234@s.whatsapp.net',
             fromMe: false,
@@ -567,7 +573,86 @@ describe('WhatsAppChannel', () => {
         },
       ]);
 
-      // Skipped — no text content to process
+      expect(downloadMediaMessage).toHaveBeenCalled();
+
+      const fs = await import('fs');
+      expect(fs.default.writeFileSync).toHaveBeenCalled();
+
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'registered@g.us',
+        expect.objectContaining({
+          content: expect.stringContaining(
+            '[Voice note: attachments/audio-msg-audio-1.ogg]',
+          ),
+        }),
+      );
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'registered@g.us',
+        expect.objectContaining({
+          content: expect.stringContaining(
+            'Use: voice-transcription attachments/audio-msg-audio-1.ogg',
+          ),
+        }),
+      );
+    });
+
+    it('uses .mp4 extension for audio/mp4 mimetype', async () => {
+      const opts = createTestOpts();
+      const channel = new WhatsAppChannel(opts);
+
+      await connectChannel(channel);
+
+      await triggerMessages([
+        {
+          key: {
+            id: 'msg-audio-mp4',
+            remoteJid: 'registered@g.us',
+            participant: '5551234@s.whatsapp.net',
+            fromMe: false,
+          },
+          message: {
+            audioMessage: { mimetype: 'audio/mp4', ptt: false },
+          },
+          pushName: 'Grace',
+          messageTimestamp: Math.floor(Date.now() / 1000),
+        },
+      ]);
+
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'registered@g.us',
+        expect.objectContaining({
+          content: expect.stringContaining('audio-msg-audio-mp4.mp4'),
+        }),
+      );
+    });
+
+    it('handles audio download failure gracefully (skips message)', async () => {
+      vi.mocked(downloadMediaMessage).mockRejectedValueOnce(
+        new Error('Download failed'),
+      );
+
+      const opts = createTestOpts();
+      const channel = new WhatsAppChannel(opts);
+
+      await connectChannel(channel);
+
+      await triggerMessages([
+        {
+          key: {
+            id: 'msg-audio-fail',
+            remoteJid: 'registered@g.us',
+            participant: '5551234@s.whatsapp.net',
+            fromMe: false,
+          },
+          message: {
+            audioMessage: { mimetype: 'audio/ogg; codecs=opus', ptt: true },
+          },
+          pushName: 'Henry',
+          messageTimestamp: Math.floor(Date.now() / 1000),
+        },
+      ]);
+
+      // Content remains empty after failed download — message skipped
       expect(opts.onMessage).not.toHaveBeenCalled();
     });
 
@@ -1211,6 +1296,117 @@ describe('WhatsAppChannel', () => {
       await expect(
         channel.setTyping('test@g.us', true),
       ).resolves.toBeUndefined();
+    });
+  });
+
+  // --- sendMedia ---
+
+  describe('sendMedia', () => {
+    it('sends image directly when connected (jpg)', async () => {
+      const opts = createTestOpts();
+      const channel = new WhatsAppChannel(opts);
+      await connectChannel(channel);
+
+      await channel.sendMedia('test@g.us', '/tmp/photo.jpg', 'Look at this');
+
+      expect(fakeSocket.sendMessage).toHaveBeenCalledWith('test@g.us', {
+        image: expect.any(Buffer),
+        caption: 'Look at this',
+      });
+    });
+
+    it('sends image for jpeg/png/gif/webp extensions', async () => {
+      const opts = createTestOpts();
+      const channel = new WhatsAppChannel(opts);
+      await connectChannel(channel);
+
+      for (const ext of ['.jpeg', '.png', '.gif', '.webp']) {
+        fakeSocket.sendMessage.mockClear();
+        await channel.sendMedia('test@g.us', `/tmp/file${ext}`);
+        expect(fakeSocket.sendMessage).toHaveBeenCalledWith('test@g.us', {
+          image: expect.any(Buffer),
+          caption: undefined,
+        });
+      }
+    });
+
+    it('sends document for pdf extension', async () => {
+      const opts = createTestOpts();
+      const channel = new WhatsAppChannel(opts);
+      await connectChannel(channel);
+
+      await channel.sendMedia('test@g.us', '/tmp/report.pdf', 'Monthly report');
+
+      expect(fakeSocket.sendMessage).toHaveBeenCalledWith('test@g.us', {
+        document: expect.any(Buffer),
+        mimetype: 'application/pdf',
+        fileName: 'report.pdf',
+        caption: 'Monthly report',
+      });
+    });
+
+    it('sends document with octet-stream for unknown extension', async () => {
+      const opts = createTestOpts();
+      const channel = new WhatsAppChannel(opts);
+      await connectChannel(channel);
+
+      await channel.sendMedia('test@g.us', '/tmp/data.bin');
+
+      expect(fakeSocket.sendMessage).toHaveBeenCalledWith('test@g.us', {
+        document: expect.any(Buffer),
+        mimetype: 'application/octet-stream',
+        fileName: 'data.bin',
+        caption: undefined,
+      });
+    });
+
+    it('queues media when disconnected', async () => {
+      const opts = createTestOpts();
+      const channel = new WhatsAppChannel(opts);
+
+      // Don't connect — channel starts disconnected
+      await channel.sendMedia('test@g.us', '/tmp/photo.jpg');
+      expect(fakeSocket.sendMessage).not.toHaveBeenCalled();
+    });
+
+    it('queues media on send failure', async () => {
+      const opts = createTestOpts();
+      const channel = new WhatsAppChannel(opts);
+      await connectChannel(channel);
+
+      fakeSocket.sendMessage.mockRejectedValueOnce(new Error('Network error'));
+
+      // Should not throw
+      await expect(
+        channel.sendMedia('test@g.us', '/tmp/photo.jpg'),
+      ).resolves.toBeUndefined();
+    });
+
+    it('flushes queued media on reconnection', async () => {
+      const opts = createTestOpts();
+      const channel = new WhatsAppChannel(opts);
+
+      // Queue media while disconnected
+      await channel.sendMedia('test@g.us', '/tmp/photo.jpg', 'caption');
+      await channel.sendMedia('test@g.us', '/tmp/report.pdf');
+
+      // Connect — flush happens automatically on open
+      await connectChannel(channel);
+
+      // Give the async flush time to complete
+      await new Promise((r) => setTimeout(r, 50));
+
+      expect(fakeSocket.sendMessage).toHaveBeenCalledTimes(2);
+      expect(fakeSocket.sendMessage).toHaveBeenNthCalledWith(1, 'test@g.us', {
+        image: expect.any(Buffer),
+        caption: 'caption',
+      });
+      expect(fakeSocket.sendMessage).toHaveBeenNthCalledWith(2, 'test@g.us', {
+        document: expect.any(Buffer),
+        mimetype: 'application/pdf',
+        fileName: 'report.pdf',
+        caption: undefined,
+      });
     });
   });
 
