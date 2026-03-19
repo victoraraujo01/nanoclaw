@@ -56,3 +56,27 @@ NEVER use markdown. Only use WhatsApp/Telegram formatting:
 - ```triple backticks``` for code
 
 No ## headings. No [links](url). No **double stars**.
+
+## Publicando uma nova skill no nanoclaw-skills
+
+O diretório `~/.claude/skills/` dentro dos containers é uma cópia rsync — não é um repo git. Para commitar uma skill nova ou modificada no repositório `nanoclaw-skills`, clone o repo em `/tmp`:
+
+```bash
+git clone https://github.com/victoraraujo01/nanoclaw-skills.git /tmp/nanoclaw-skills
+git -C /tmp/nanoclaw-skills config user.email "claw@nanoclaw"
+git -C /tmp/nanoclaw-skills config user.name "Claw"
+
+# Copiar a skill (use o nome da skill que foi desenvolvida)
+cp -r ~/.claude/skills/<nome-da-skill> /tmp/nanoclaw-skills/
+
+# Commitar e push
+git -C /tmp/nanoclaw-skills add <nome-da-skill>/
+git -C /tmp/nanoclaw-skills commit -m "feat: add <nome-da-skill>"
+git -C /tmp/nanoclaw-skills push
+```
+
+O `GITHUB_TOKEN` já está disponível no container via variável de ambiente — o git está configurado globalmente para usá-lo automaticamente.
+
+Após o push, a skill ficará disponível em todos os grupos no próximo restart do nanoclaw (`./start-nanoclaw.sh`).
+
+**Atenção:** não commitar skills do core (`pdf-reader`, `pdf-generator`, `voice-transcription`, `agent-browser`) — o `.gitignore` do repo já as exclui.
