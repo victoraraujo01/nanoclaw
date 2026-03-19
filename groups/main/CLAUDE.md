@@ -51,6 +51,8 @@ Do NOT use markdown headings (##) in WhatsApp messages. Only use:
 - • Bullets (bullet points)
 - ```Code blocks``` (triple backticks)
 
+Do NOT use markdown tables. If you need to present tabular data, format it inside a monospaced code block using ASCII characters (e.g., `|`, `-`, `+`).
+
 Keep messages clean and readable for WhatsApp.
 
 ---
@@ -117,6 +119,30 @@ sqlite3 /workspace/project/store/messages.db "
 "
 ```
 
+#### Identifying Participation in Unnamed Groups
+
+Cross-reference `chats` with `sender-key` auth files to detect groups the bot participates in but hasn't resolved a name for yet:
+
+```python
+import sqlite3, os, re
+
+auth_dir = '/workspace/project/store/auth'
+sk_jids = set()
+for f in os.listdir(auth_dir):
+    m = re.match(r'sender-key-(.+@g\.us)--', f)
+    if m:
+        sk_jids.add(m.group(1))
+
+conn = sqlite3.connect('/workspace/project/store/messages.db')
+chats = conn.execute("SELECT jid, name, last_message_time FROM chats WHERE is_group=1 ORDER BY last_message_time DESC").fetchall()
+registered = {r[0] for r in conn.execute('SELECT jid FROM registered_groups').fetchall()}
+
+for jid, name, last_ts in chats:
+    status = '✓ registered' if jid in registered else ('participant' if jid in sk_jids else 'visible')
+    label = name if name and name != jid else '(unnamed)'
+    print(f"{status:<14} {label:<35} {(last_ts or '')[:16]:<22} {jid}")
+```
+
 ### Registered Groups Config
 
 Groups are registered in the SQLite `registered_groups` table:
@@ -154,6 +180,30 @@ Fields:
 3. Optionally include `containerConfig` for additional mounts
 4. The group folder is created automatically: `/workspace/project/groups/{folder-name}/`
 5. Optionally create an initial `CLAUDE.md` for the group
+
+#### Alternative: Register via IPC (without MCP tool)
+
+If the `register_group` MCP tool is unavailable, write directly to the IPC tasks folder:
+
+```python
+import json, time
+
+msg = {
+    "type": "register_group",
+    "jid": "120363426194022409@g.us",
+    "name": "Group Name",
+    "folder": "whatsapp_group-name",
+    "trigger": "@Claw",
+    "requiresTrigger": True,
+    "groupFolder": "whatsapp_main",
+    "timestamp": "2026-03-17T02:06:00.000Z"
+}
+fname = f'/workspace/ipc/tasks/register-{int(time.time()*1000)}.json'
+with open(fname, 'w') as f:
+    json.dump(msg, f)
+```
+
+Confirm via logs: `Group registered · jid: ... · folder: ...`
 
 Folder naming convention — channel prefix with underscore separator:
 - WhatsApp "Family Chat" → `whatsapp_family-chat`
@@ -232,6 +282,30 @@ Read `/workspace/project/data/registered_groups.json` and format it nicely.
 
 ---
 
+## Sending Media via IPC
+
+Write a JSON file to `/workspace/ipc/messages/`. ⚠️ `filePath` must be the **host path**, not the container path:
+- Container: `/workspace/group/attachments/file.pdf`
+- Host: `/home/nanoclaw/nanoclaw/groups/whatsapp_main/attachments/file.pdf`
+
+```python
+import json, time
+
+msg = {
+    "type": "media",
+    "chatJid": "5521999885156@s.whatsapp.net",
+    "filePath": "/home/nanoclaw/nanoclaw/groups/whatsapp_main/attachments/file.pdf",
+    "caption": "Aqui está o relatório 📄",
+    "groupFolder": "whatsapp_main",
+    "timestamp": "2026-03-17T00:00:00.000Z"
+}
+fname = f'/workspace/ipc/messages/media-{int(time.time()*1000)}.json'
+with open(fname, 'w') as f:
+    json.dump(msg, f)
+```
+
+---
+
 ## Global Memory
 
 You can read and write to `/workspace/project/groups/global/CLAUDE.md` for facts that should apply to all groups. Only update global memory when explicitly asked to "remember this globally" or similar.
@@ -244,3 +318,39 @@ When scheduling tasks for other groups, use the `target_group_jid` parameter wit
 - `schedule_task(prompt: "...", schedule_type: "cron", schedule_value: "0 9 * * 1", target_group_jid: "120363336345536173@g.us")`
 
 The task will run in that group's context with access to their files and memory.
+
+---
+
+## Skills Architecture
+
+- **Core skills** (`container/skills/`): copied automatically to every group by `container-runner.ts` on each container start. Updates require Docker rebuild. Examples: `pdf-reader`, `pdf-generator`, `voice-transcription`, `agent-browser`
+- **Custom skills** (`victoraraujo01/nanoclaw-skills` repo): synced via `start-nanoclaw.sh` on startup. `.gitignore` excludes core skills to avoid conflicts. Examples: `flights`
+
+---
+
+## PDF Templates
+
+Templates em `nanoclaw-skills/pdf-templates/`, disponíveis após startup em `/home/node/.claude/skills/pdf-templates/`.
+
+- `relatorio.html` — relatórios de sessão/desenvolvimento (azul #1e3a5f + laranja #f0813a): cover, cards, seções numeradas, timeline, badges, callout, table, footer
+- `itinerario.html` — roteiros de viagem: cover, cards de duração/orçamento/destinos/pessoas, timeline de dias, tabela de custos
+
+### Uso
+1. Copiar template → `/workspace/group/doc.html`
+2. Substituir os blocos marcados com `<!-- SUBSTITUA: ... -->`
+3. `generate-pdf /workspace/group/doc.html /workspace/group/doc.pdf`
+4. Enviar via IPC media message (host path: `/home/nanoclaw/nanoclaw/groups/whatsapp_main/doc.pdf`)
+
+---
+
+## Interrompendo o agente com /stop
+
+Qualquer grupo registrado aceita o comando `/stop` enviado pelo usuário.
+
+**Comportamento:**
+- O host cria o sentinel `_close` no IPC do grupo
+- O container detecta e encerra a sessão de forma limpa
+- A resposta em andamento é descartada
+- A próxima mensagem inicia um novo container, retomando o contexto da conversa (sessionId preservado)
+
+**Quando usar:** quando o agente está preso num loop, demorando demais, ou foi acionado por engano.
