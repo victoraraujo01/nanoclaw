@@ -1,0 +1,51 @@
+#!/bin/bash
+# generate-pdf — Convert HTML to PDF using headless Chromium
+# Usage: generate-pdf <input.html> <output.pdf>
+
+set -e
+
+CHROMIUM="${AGENT_BROWSER_EXECUTABLE_PATH:-chromium}"
+
+usage() {
+  echo "Usage: generate-pdf <input.html> <output.pdf>"
+  echo ""
+  echo "Examples:"
+  echo "  generate-pdf report.html report.pdf"
+  echo "  generate-pdf /workspace/group/invoice.html /workspace/group/invoice.pdf"
+  exit 1
+}
+
+if [ "$#" -ne 2 ]; then
+  usage
+fi
+
+INPUT="$1"
+OUTPUT="$2"
+
+if [ ! -f "$INPUT" ]; then
+  echo "Error: input file not found: $INPUT" >&2
+  exit 1
+fi
+
+# Resolve to absolute path so file:// URI works from any working dir
+INPUT_ABS="$(realpath "$INPUT")"
+OUTPUT_ABS="$(realpath -m "$OUTPUT")"
+
+"$CHROMIUM" \
+  --headless \
+  --disable-gpu \
+  --no-sandbox \
+  --disable-dev-shm-usage \
+  --run-all-compositor-stages-before-draw \
+  --print-to-pdf="$OUTPUT_ABS" \
+  --no-pdf-header-footer \
+  --print-to-pdf-no-header \
+  "file://$INPUT_ABS" 2>/dev/null
+
+if [ -f "$OUTPUT_ABS" ]; then
+  SIZE=$(du -sh "$OUTPUT_ABS" | cut -f1)
+  echo "PDF generated: $OUTPUT_ABS ($SIZE)"
+else
+  echo "Error: PDF generation failed" >&2
+  exit 1
+fi

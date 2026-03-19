@@ -25,7 +25,21 @@ RUN apt-get update && apt-get install -y \
     curl \
     git \
     poppler-utils \
-    && rm -rf /var/lib/apt/lists/*
+    ripgrep \
+    fd-find \
+    python3 \
+    python3-pip \
+    ffmpeg \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -s /usr/bin/fdfind /usr/local/bin/fd
+
+# Install xh (curl alternative with cleaner output)
+RUN curl -fsSL https://github.com/ducaale/xh/releases/download/v0.25.3/xh-v0.25.3-x86_64-unknown-linux-musl.tar.gz \
+    | tar -xz --strip-components=1 -C /usr/local/bin "xh-v0.25.3-x86_64-unknown-linux-musl/xh"
+
+# Install faster-whisper for voice transcription
+RUN pip3 install faster-whisper --break-system-packages \
+    && python3 -c "from faster_whisper import WhisperModel; WhisperModel('base', device='cpu', compute_type='int8')"
 
 # Set Chromium path for agent-browser
 ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium
@@ -52,6 +66,18 @@ RUN npm run build
 # Install pdf-reader CLI
 COPY skills/pdf-reader/pdf-reader /usr/local/bin/pdf-reader
 RUN chmod +x /usr/local/bin/pdf-reader
+
+# Install generate-pdf CLI
+COPY skills/pdf-generator/generate-pdf /usr/local/bin/generate-pdf
+RUN chmod +x /usr/local/bin/generate-pdf
+
+# Install voice-transcription CLI
+COPY skills/voice-transcription/transcribe.py /usr/local/lib/voice-transcription/transcribe.py
+COPY skills/voice-transcription/voice-transcription /usr/local/bin/voice-transcription
+RUN chmod +x /usr/local/bin/voice-transcription
+
+# Configure git credential helper for GitHub token auth
+RUN git config --global credential.helper store
 
 # Create workspace directories
 RUN mkdir -p /workspace/group /workspace/global /workspace/extra /workspace/ipc/messages /workspace/ipc/tasks /workspace/ipc/input
