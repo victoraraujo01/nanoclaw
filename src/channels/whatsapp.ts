@@ -18,7 +18,16 @@ import {
   ASSISTANT_NAME,
   GROUPS_DIR,
   STORE_DIR,
+  WHATSAPP_ALERT_JID,
 } from '../config.js';
+import {
+  computePhoneOfflineAlert,
+  initPhonePresence,
+  isResetMessage,
+  loadPresenceState,
+  recordPhoneSeen,
+  savePresenceState,
+} from './whatsapp-presence.js';
 import { getLastGroupSync, setLastGroupSync, updateChatName } from '../db.js';
 import { isImageMessage, processImage } from '../image.js';
 import { logger } from '../logger.js';
@@ -31,11 +40,51 @@ import {
 import { registerChannel, ChannelOpts } from './registry.js';
 
 const GROUP_SYNC_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
+const PHONE_PRESENCE_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000; // 6 hours
 
 export interface WhatsAppChannelOpts {
   onMessage: OnInboundMessage;
   onChatMetadata: OnChatMetadata;
   registeredGroups: () => Record<string, RegisteredGroup>;
+}
+
+function detectBotMention(
+  content: string,
+  mentionedJids: string[],
+  botPhone: string,
+  botLid: string,
+  assistantName: string,
+): boolean {
+  // Already has @AssistantName — no prepend needed
+  if (
+    content
+      .trimStart()
+      .toLowerCase()
+      .startsWith(`@${assistantName.toLowerCase()}`)
+  ) {
+    return false;
+  }
+
+  // Case 1: native WhatsApp @mention via message metadata
+  if (
+    mentionedJids.length > 0 &&
+    mentionedJids.some(
+      (j) =>
+        (botPhone.length > 0 && j.startsWith(botPhone)) ||
+        (botLid.length > 0 && j.startsWith(botLid)),
+    )
+  )
+    return true;
+
+  // Case 2: LID number in plain text (e.g. @1254851903529)
+  if (botLid.length > 0 && new RegExp(`@${botLid}\\b`).test(content))
+    return true;
+
+  // Case 3: phone number in plain text (e.g. @5521972796870)
+  if (botPhone.length > 0 && new RegExp(`@${botPhone}\\b`).test(content))
+    return true;
+
+  return false;
 }
 
 export class WhatsAppChannel implements Channel {
@@ -52,6 +101,7 @@ export class WhatsAppChannel implements Channel {
   }> = [];
   private flushing = false;
   private groupSyncTimerStarted = false;
+  private presenceTimerStarted = false;
 
   private opts: WhatsAppChannelOpts;
 
@@ -161,6 +211,18 @@ export class WhatsAppChannel implements Channel {
           }, GROUP_SYNC_INTERVAL_MS);
         }
 
+        // Phone-presence monitor: warn the traveling phone before WhatsApp's
+        // 14-day offline cutoff disconnects the linked (home phone) account.
+        if (WHATSAPP_ALERT_JID && !this.presenceTimerStarted) {
+          this.presenceTimerStarted = true;
+          initPhonePresence();
+          this.runPhonePresenceCheck();
+          setInterval(
+            () => this.runPhonePresenceCheck(),
+            PHONE_PRESENCE_CHECK_INTERVAL_MS,
+          );
+        }
+
         // Signal first connection to caller
         if (onFirstOpen) {
           onFirstOpen();
@@ -200,6 +262,25 @@ export class WhatsAppChannel implements Channel {
             isGroup,
           );
 
+          // Phone-presence: a message typed on the home phone (fromMe, no bot
+          // prefix) proves it's online; a reset keyword from the traveling
+          // phone confirms it manually. Either clears pending offline alerts.
+          const presenceText =
+            normalized.conversation ||
+            normalized.extendedTextMessage?.text ||
+            '';
+          const fromHomePhone =
+            (msg.key.fromMe || false) &&
+            !ASSISTANT_HAS_OWN_NUMBER &&
+            !presenceText.startsWith(`${ASSISTANT_NAME}:`);
+          const manualReset =
+            WHATSAPP_ALERT_JID !== '' &&
+            chatJid === WHATSAPP_ALERT_JID &&
+            isResetMessage(presenceText);
+          if (WHATSAPP_ALERT_JID && (fromHomePhone || manualReset)) {
+            this.handlePhoneSeen(manualReset);
+          }
+
           // Only deliver full message for registered groups
           const groups = this.opts.registeredGroups();
           if (groups[chatJid]) {
@@ -209,6 +290,23 @@ export class WhatsAppChannel implements Channel {
               normalized.imageMessage?.caption ||
               normalized.videoMessage?.caption ||
               '';
+
+            const mentionedJids: string[] =
+              normalized.extendedTextMessage?.contextInfo?.mentionedJid ?? [];
+            const botPhone = (this.sock.user?.id ?? '').split(':')[0];
+            const botLid = (this.sock.user?.lid ?? '').split(':')[0];
+
+            if (
+              detectBotMention(
+                content,
+                mentionedJids,
+                botPhone,
+                botLid,
+                ASSISTANT_NAME,
+              )
+            ) {
+              content = `@${ASSISTANT_NAME} ${content}`.trim();
+            }
 
             // PDF attachment handling
             if (normalized?.documentMessage?.mimetype === 'application/pdf') {
@@ -350,7 +448,11 @@ export class WhatsAppChannel implements Channel {
     }
   }
 
-  async sendMedia(jid: string, filePath: string, caption?: string): Promise<void> {
+  async sendMedia(
+    jid: string,
+    filePath: string,
+    caption?: string,
+  ): Promise<void> {
     if (!this.connected) {
       this.outgoingMediaQueue.push({ jid, filePath, caption });
       logger.info(
@@ -458,6 +560,39 @@ export class WhatsAppChannel implements Channel {
     } catch (err) {
       logger.error({ err }, 'Failed to sync group metadata');
     }
+  }
+
+  /** Record home-phone activity and confirm if it clears a pending alert. */
+  private handlePhoneSeen(manualReset: boolean): void {
+    const wasAlerting = recordPhoneSeen();
+    if (wasAlerting && WHATSAPP_ALERT_JID) {
+      const reason = manualReset
+        ? 'Confirmado'
+        : 'Celular de casa voltou a ficar online';
+      this.sendMessage(
+        WHATSAPP_ALERT_JID,
+        `✅ ${reason}. Contador zerado — alertas de conexão cancelados.`,
+      ).catch((err) =>
+        logger.warn({ err }, 'Failed to send presence-reset confirmation'),
+      );
+    }
+  }
+
+  /** Check the offline window and escalate alerts to the traveling phone. */
+  private runPhonePresenceCheck(): void {
+    if (!WHATSAPP_ALERT_JID) return;
+    const state = loadPresenceState();
+    if (!state) return;
+    const alert = computePhoneOfflineAlert(state, Date.now());
+    if (!alert) return;
+    logger.info(
+      { daysOffline: alert.daysOffline },
+      'Home phone offline — sending alert',
+    );
+    this.sendMessage(WHATSAPP_ALERT_JID, alert.text).catch((err) =>
+      logger.warn({ err }, 'Failed to send phone-offline alert'),
+    );
+    savePresenceState({ ...state, lastAlertedDay: alert.daysOffline });
   }
 
   private scheduleReconnect(attempt: number): void {

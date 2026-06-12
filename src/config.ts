@@ -6,13 +6,28 @@ import { readEnvFile } from './env.js';
 // Read config values from .env (falls back to process.env).
 // Secrets (API keys, tokens) are NOT read here — they are loaded only
 // by the credential proxy (credential-proxy.ts), never exposed to containers.
-const envConfig = readEnvFile(['ASSISTANT_NAME', 'ASSISTANT_HAS_OWN_NUMBER']);
+const envConfig = readEnvFile([
+  'ASSISTANT_NAME',
+  'ASSISTANT_HAS_OWN_NUMBER',
+  'WHATSAPP_ALERT_NUMBER',
+]);
 
 export const ASSISTANT_NAME =
   process.env.ASSISTANT_NAME || envConfig.ASSISTANT_NAME || 'Andy';
 export const ASSISTANT_HAS_OWN_NUMBER =
   (process.env.ASSISTANT_HAS_OWN_NUMBER ||
     envConfig.ASSISTANT_HAS_OWN_NUMBER) === 'true';
+
+// Phone-presence monitor: WhatsApp JID that receives "home phone offline"
+// alerts (the user's traveling phone). Empty string disables the monitor.
+const alertNumber = (
+  process.env.WHATSAPP_ALERT_NUMBER ||
+  envConfig.WHATSAPP_ALERT_NUMBER ||
+  ''
+).replace(/\D/g, '');
+export const WHATSAPP_ALERT_JID = alertNumber
+  ? `${alertNumber}@s.whatsapp.net`
+  : '';
 export const POLL_INTERVAL = 2000;
 export const SCHEDULER_POLL_INTERVAL = 60000;
 
@@ -63,7 +78,7 @@ function escapeRegex(str: string): string {
 }
 
 export const TRIGGER_PATTERN = new RegExp(
-  `^@${escapeRegex(ASSISTANT_NAME)}\\b`,
+  `(^|\\s)@${escapeRegex(ASSISTANT_NAME)}\\b`,
   'i',
 );
 

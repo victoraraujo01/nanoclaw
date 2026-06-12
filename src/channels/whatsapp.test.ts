@@ -9,6 +9,7 @@ vi.mock('../config.js', () => ({
   ASSISTANT_NAME: 'Andy',
   ASSISTANT_HAS_OWN_NUMBER: false,
   GROUPS_DIR: '/tmp/test-groups',
+  WHATSAPP_ALERT_JID: '',
 }));
 
 // Mock logger
@@ -31,12 +32,10 @@ vi.mock('../db.js', () => ({
 // Mock image module
 vi.mock('../image.js', () => ({
   isImageMessage: vi.fn().mockReturnValue(false),
-  processImage: vi
-    .fn()
-    .mockResolvedValue({
-      content: '[Image: attachments/test.jpg]',
-      relativePath: 'attachments/test.jpg',
-    }),
+  processImage: vi.fn().mockResolvedValue({
+    content: '[Image: attachments/test.jpg]',
+    relativePath: 'attachments/test.jpg',
+  }),
 }));
 
 // Mock fs
